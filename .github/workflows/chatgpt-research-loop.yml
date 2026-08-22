@@ -1,0 +1,110 @@
+name: ChatGPT Research Loop
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+
+# Serialize deliveries for one repository so two terminal receipts cannot race
+# against the same local browser session or dedupe state.
+concurrency:
+  group: chatgpt-research-loop-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  validate-receipt:
+    # Cheap public-event prefilter. The Python parser independently re-checks
+    # marker, actor identity and field safety before the privileged job exists.
+    if: >-
+      contains(github.event.comment.body, '<!-- chatgpt-research-loop:receipt-v1 -->') &&
+      contains(github.event.comment.body, 'TASK_DECISION=') &&
+      (github.actor == github.repository_owner ||
+       contains(format(',{0},', vars.CHATGPT_LOOP_AUTHORIZED_ACTORS), format(',{0},', github.actor)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      eligible: ${{ steps.parse.outputs.eligible }}
+      reason: ${{ steps.parse.outputs.reason }}
+      receipt_b64: ${{ steps.parse.outputs.receipt_b64 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.11'
+
+      - name: Parse and minimize completion receipt
+        id: parse
+        shell: bash
+        env:
+          EXTRA_AUTHORIZED_ACTORS: ${{ vars.CHATGPT_LOOP_AUTHORIZED_ACTORS }}
+        run: |
+          set -euo pipefail
+          python tools/parse_completion_receipt.py \
+            --event-json "$GITHUB_EVENT_PATH" \
+            --output-json "$RUNNER_TEMP/chatgpt-loop-receipt.json" \
+            --authorized-actors "$EXTRA_AUTHORIZED_ACTORS"
+
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "chatgpt-loop-receipt.json"
+          data = json.loads(path.read_text(encoding="utf-8"))
+          eligible = bool(data.get("eligible"))
+          reason = str(data.get("reason") or "")
+          receipt_b64 = ""
+          if eligible:
+              compact = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+              receipt_b64 = base64.b64encode(compact.encode("utf-8")).decode("ascii")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"eligible={str(eligible).lower()}\n")
+              fh.write(f"reason={reason}\n")
+              fh.write(f"receipt_b64={receipt_b64}\n")
+          PY
+
+      - name: Report rejected receipt
+        if: steps.parse.outputs.eligible != 'true'
+        run: |
+          echo "CHATGPT_RESEARCH_LOOP_WAKE=SKIP"
+          echo "REASON=${{ steps.parse.outputs.reason }}"
+
+  wake-existing-chatgpt-conversation:
+    needs: validate-receipt
+    if: needs.validate-receipt.outputs.eligible == 'true'
+    # Use a dedicated custom label so the browser-capable runner cannot be
+    # accidentally replaced by a generic self-hosted machine.
+    runs-on: [self-hosted, windows, x64, chatgpt-loop]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Restore sanitized receipt
+        shell: powershell
+        env:
+          RECEIPT_B64: ${{ needs.validate-receipt.outputs.receipt_b64 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:RECEIPT_B64)) {
+            throw "sanitized receipt payload missing"
+          }
+          $bytes = [Convert]::FromBase64String($env:RECEIPT_B64)
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\chatgpt-loop-receipt.json", $bytes)
+
+      - name: Wake exact existing ChatGPT conversation
+        shell: powershell
+        env:
+          CHATGPT_RESEARCH_BRAIN_URL: ${{ secrets.CHATGPT_RESEARCH_BRAIN_URL }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:GITHUB_WORKSPACE\tools\wake_chatgpt.ps1" `
+            -ReceiptJsonPath "$env:RUNNER_TEMP\chatgpt-loop-receipt.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -1,0 +1,6 @@
+# Security-sensitive paths should stay under explicit owner review.
+* @faganghuang68-netizen
+
+/.github/workflows/ @faganghuang68-netizen
+/tools/ @faganghuang68-netizen
+/SECURITY.md @faganghuang68-netizen
