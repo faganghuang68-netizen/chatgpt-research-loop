@@ -2,7 +2,7 @@
 
 > Event-driven, API-free wake-up bridge from trusted GitHub completion receipts to an exact existing ChatGPT conversation.
 
-**Status:** experimental v0.1 release candidate
+**Status:** experimental v0.1.0 — first public release
 
 **Unofficial project. Not affiliated with or endorsed by OpenAI or GitHub.**
 
